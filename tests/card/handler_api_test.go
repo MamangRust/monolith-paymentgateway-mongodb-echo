@@ -1,0 +1,262 @@
+package card_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	card_handler "github.com/MamangRust/monolith-payment-gateway-apigateway/handler/card"
+
+	"github.com/MamangRust/monolith-payment-gateway-card/handler"
+	"github.com/MamangRust/monolith-payment-gateway-card/repository"
+	"github.com/MamangRust/monolith-payment-gateway-card/service"
+	pb "github.com/MamangRust/monolith-payment-gateway-pb/card"
+	pbuser "github.com/MamangRust/monolith-payment-gateway-pb/user"
+	adapter "github.com/MamangRust/monolith-payment-gateway-pkg/adapter"
+	"github.com/MamangRust/monolith-payment-gateway-pkg/hash"
+	"github.com/MamangRust/monolith-payment-gateway-pkg/logger"
+	"github.com/MamangRust/monolith-payment-gateway-shared/cache"
+	apierror "github.com/MamangRust/monolith-payment-gateway-shared/errors"
+	"github.com/MamangRust/monolith-payment-gateway-shared/observability"
+	tests "github.com/MamangRust/monolith-payment-gateway-test"
+	user_handler "github.com/MamangRust/monolith-payment-gateway-user/handler"
+	user_repository "github.com/MamangRust/monolith-payment-gateway-user/repository"
+	user_service "github.com/MamangRust/monolith-payment-gateway-user/service"
+	"github.com/labstack/echo/v4"
+	redis_client "github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/suite"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/test/bufconn"
+)
+
+type CardApiTestSuite struct {
+	suite.Suite
+	ts         *tests.TestSuite
+	echo       *echo.Echo
+	grpcServer *grpc.Server
+	lis        *bufconn.Listener
+	userID     int32
+	cardID     int32
+	cardNumber string
+}
+
+func (s *CardApiTestSuite) SetupSuite() {
+	ts, err := tests.SetupTestSuite()
+	s.Require().NoError(err)
+	s.ts = ts
+
+	mongoDB, err := s.ts.MongoDB()
+	if err != nil {
+		s.Require().NoError(err)
+	}
+	opts, err := redis_client.ParseURL(s.ts.RedisURL)
+	s.Require().NoError(err)
+	redisClient := redis_client.NewClient(opts)
+
+	repos := repository.NewRepositories(mongoDB, nil)
+
+	logger.ResetInstance()
+	lp := sdklog.NewLoggerProvider()
+	log, _ := logger.NewLogger("test", lp)
+
+	// CreateUser assigns the default ROLE_ADMIN through the role service.
+	roleQueryClient, roleCommandClient, err := s.ts.UserRoleAdapters(log)
+	s.Require().NoError(err)
+	userRepos := user_repository.NewRepositories(mongoDB, roleQueryClient, roleCommandClient)
+
+	hasher := hash.NewHashingPassword()
+	cacheMetrics, _ := observability.NewCacheMetrics("test")
+	cacheStore := cache.NewCacheStore(redisClient, log, cacheMetrics)
+
+	userSvc := user_service.NewService(&user_service.Deps{
+		Cache:        cacheStore,
+		Repositories: userRepos,
+		Hash:         hasher,
+		Logger:       log,
+	})
+	userH := user_handler.NewHandler(userSvc)
+
+	// The card service resolves users through its UserAdapter, so serve the
+	// in-process user service over its own bufconn listener and point the
+	// adapter at it. The card services keep their own listener below.
+	userLis := bufconn.Listen(1024 * 1024)
+	userServer := grpc.NewServer()
+	pbuser.RegisterUserQueryServiceServer(userServer, userH)
+	go func() { _ = userServer.Serve(userLis) }()
+	s.T().Cleanup(userServer.Stop)
+
+	userConn, err := grpc.DialContext(context.Background(), "bufuser",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return userLis.Dial()
+		}),
+		grpc.WithInsecure())
+	s.Require().NoError(err)
+	s.T().Cleanup(func() { _ = userConn.Close() })
+
+	cardSvc := service.NewService(&service.Deps{
+		Cache:        cacheStore,
+		Repositories: repos,
+		UserAdapter:  adapter.NewUserAdapter(pbuser.NewUserQueryServiceClient(userConn)),
+		Logger:       log,
+		Kafka:        nil,
+	})
+	cardH := handler.NewHandler(cardSvc)
+
+	// Setup gRPC server
+	s.lis = bufconn.Listen(1024 * 1024)
+	s.grpcServer = grpc.NewServer()
+	pb.RegisterCardQueryServiceServer(s.grpcServer, cardH)
+	pb.RegisterCardCommandServiceServer(s.grpcServer, cardH)
+
+	go func() {
+		if err := s.grpcServer.Serve(s.lis); err != nil {
+		}
+	}()
+
+	s.echo = echo.New()
+
+	// Middleware for injecting userID in tests. The card query handler reads
+	// c.Get("userId") (lowercase d), matching the real JWT middleware.
+	s.echo.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if uid := c.Request().Header.Get("X-Test-User-ID"); uid != "" {
+				c.Set("userId", uid)
+			}
+			return next(c)
+		}
+	})
+
+	conn, err := grpc.DialContext(context.Background(), "bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return s.lis.Dial()
+		}),
+		grpc.WithInsecure())
+	s.Require().NoError(err)
+
+	obs, err := observability.NewObservability("test", log)
+	s.Require().NoError(err)
+	apiHandler := apierror.NewApiHandler(obs, log)
+
+	card_handler.RegisterCardHandler(&card_handler.DepsCard{
+		Client:     conn,
+		E:          s.echo,
+		Logger:     log,
+		Cache:      cacheStore,
+		ApiHandler: apiHandler,
+	})
+
+	// Create a user for testing
+	ctx := context.Background()
+	userRes, err := userH.Create(ctx, &pbuser.CreateUserRequest{
+		Firstname:       "Card",
+		Lastname:        "Api",
+		Email:           fmt.Sprintf("card.api.%d.%d@example.com", time.Now().UnixNano(), time.Now().UnixNano()%1000),
+		Password:        "Password123!",
+		ConfirmPassword: "Password123!",
+	})
+	s.Require().NoError(err)
+	s.userID = userRes.Data.Id
+}
+
+func (s *CardApiTestSuite) TearDownSuite() {
+	if s.grpcServer != nil {
+		s.grpcServer.Stop()
+	}
+	if s.ts != nil {
+		s.ts.Teardown()
+	}
+}
+
+func (s *CardApiTestSuite) Test1_CardLifecycle() {
+	// Create
+	reqJSON := fmt.Sprintf(`{"user_id": %d, "card_type": "debit", "expire_date": "%s", "cvv": "123", "card_provider": "visa"}`, s.userID, time.Now().AddDate(5, 0, 0).Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodPost, "/api/card-command/create", strings.NewReader(reqJSON))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+
+	s.Equal(http.StatusOK, rec.Code)
+	var res map[string]interface{}
+	err := json.Unmarshal(rec.Body.Bytes(), &res)
+	s.NoError(err)
+	data := res["data"].(map[string]interface{})
+	s.cardID = int32(data["id"].(float64))
+	s.cardNumber = data["card_number"].(string)
+	s.Equal("debit", data["card_type"])
+
+	// FindById
+	req = httptest.NewRequest(http.MethodGet, "/api/card-query/"+strconv.Itoa(int(s.cardID)), nil)
+	rec = httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+
+	// Update
+	updateJSON := fmt.Sprintf(`{"card_id": %d, "user_id": %d, "card_type": "credit", "expire_date": "%s", "cvv": "456", "card_provider": "mastercard"}`, s.cardID, s.userID, time.Now().AddDate(5, 0, 0).Format(time.RFC3339))
+	req = httptest.NewRequest(http.MethodPost, "/api/card-command/update/"+strconv.Itoa(int(s.cardID)), strings.NewReader(updateJSON))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+}
+
+func (s *CardApiTestSuite) Test2_QueryOperations() {
+	// FindAll
+	req := httptest.NewRequest(http.MethodGet, "/api/card-query?page=1&page_size=10", nil)
+	rec := httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+
+	// FindActive
+	req = httptest.NewRequest(http.MethodGet, "/api/card-query/active?page=1&page_size=10", nil)
+	rec = httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+
+	// FindByUserID
+	req = httptest.NewRequest(http.MethodGet, "/api/card-query/user", nil)
+	req.Header.Set("X-Test-User-ID", strconv.Itoa(int(s.userID)))
+	rec = httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+
+	// FindByCardNumber
+	req = httptest.NewRequest(http.MethodGet, "/api/card-query/card_number/"+s.cardNumber, nil)
+	rec = httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+}
+
+func (s *CardApiTestSuite) Test3_TrashAndRestore() {
+	// Trash
+	req := httptest.NewRequest(http.MethodPost, "/api/card-command/trashed/"+strconv.Itoa(int(s.cardID)), nil)
+	rec := httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+
+	// FindTrashed
+	req = httptest.NewRequest(http.MethodGet, "/api/card-query/trashed?page=1&page_size=10", nil)
+	rec = httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+
+	// Restore
+	req = httptest.NewRequest(http.MethodPost, "/api/card-command/restore/"+strconv.Itoa(int(s.cardID)), nil)
+	rec = httptest.NewRecorder()
+	s.echo.ServeHTTP(rec, req)
+	s.Equal(http.StatusOK, rec.Code)
+}
+
+func TestCardApiSuite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	suite.Run(t, new(CardApiTestSuite))
+}
